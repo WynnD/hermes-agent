@@ -496,7 +496,7 @@ class TestCmdUpdateBranchFlag:
     target without monkey-patching the implementation.
     """
 
-    def _branch_side_effect(self, current_branch, target_branch, *, checkout_fails=False, track_fails=False, commit_count="0"):
+    def _branch_side_effect(self, current_branch, target_branch, *, checkout_fails=False, track_fails=False, commit_count="0", pre_checkout_sha="abc123"):
         """Mock side-effect that knows about checkout/track behavior.
 
         - ``current_branch``  what ``git rev-parse --abbrev-ref HEAD`` returns
@@ -506,6 +506,7 @@ class TestCmdUpdateBranchFlag:
         - ``track_fails``     if True, ``git checkout -B <target> origin/<target>`` ALSO fails
                               (simulates branch absent on origin too)
         - ``commit_count``    rev-list count returned (0 = up-to-date, >0 = behind)
+        - ``pre_checkout_sha`` SHA returned by ``git rev-parse HEAD`` before checkout
         """
 
         def side_effect(cmd, **kwargs):
@@ -513,6 +514,9 @@ class TestCmdUpdateBranchFlag:
 
             if "rev-parse" in joined and "--abbrev-ref" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
+
+            if "rev-parse" in joined and "HEAD" in joined and "--abbrev-ref" not in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{pre_checkout_sha}\n", stderr="")
 
             if "checkout" in joined and "-B" in joined:
                 rc = 128 if track_fails else 0
@@ -630,6 +634,48 @@ class TestCmdUpdateBranchFlag:
         out = capsys.readouterr().out
         assert "does not exist locally or on origin" in out
         assert "nonexistent" in out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_checkout_b_uses_pre_checkout_sha_for_rev_list(self, mock_run, _mock_which, capsys):
+        """After ``checkout -B`` fallback, rev-list must compare pre-checkout SHA
+        vs origin/<branch>, not HEAD vs origin/<branch>.
+
+        Regression test: on a detached HEAD with a missing local branch, the
+        ``checkout -B <branch> origin/<branch>`` fallback puts HEAD at the
+        same commit as origin/<branch>.  The old code compared
+        ``HEAD..origin/<branch>`` which was always 0, falsely printing
+        "already up to date" and skipping post-pull processing (pip install,
+        node deps, skills sync, config migration).
+        """
+        mock_run.side_effect = self._branch_side_effect(
+            current_branch="HEAD",  # detached HEAD
+            target_branch="bb/gui",
+            checkout_fails=True,    # plain checkout fails (no local branch)
+            track_fails=False,      # -B from origin/bb/gui succeeds
+            commit_count="3",       # new commits exist on remote
+            pre_checkout_sha="deadbeef",
+        )
+        args = SimpleNamespace(branch="bb/gui")
+
+        cmd_update(args)
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        rev_list_cmds = [c for c in commands if "rev-list" in c]
+        # After -B, rev-list MUST use the pre-checkout SHA, not HEAD
+        assert len(rev_list_cmds) >= 1
+        assert "deadbeef" in rev_list_cmds[0], (
+            f"Expected pre-checkout SHA in rev-list, got: {rev_list_cmds[0]}"
+        )
+        assert "HEAD" not in rev_list_cmds[0].split(), (
+            f"rev-list must not use HEAD after -B checkout, got: {rev_list_cmds[0]}"
+        )
+
+        out = capsys.readouterr().out
+        # Must NOT falsely report "already up to date"
+        assert "already up to date" not in out.lower()
+        # Must report the new commits
+        assert "3 new commit" in out
 
 
 class TestCmdUpdateCheckBranchFlag:

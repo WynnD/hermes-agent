@@ -9935,7 +9935,8 @@ def _reexec_for_post_pull(args, gateway_mode: bool):
         argv.extend(["--pre-update-snapshot", snapshot_id])
 
     exec_argv = [sys.executable, "-m", "hermes_cli.main"] + argv
-
+    print("running post-pull step: ")
+    print(" ".join(exec_argv))
     if sys.platform == "win32":
         # Windows relay: parent stays alive until child finishes so the
         # bootstrap installer (update.rs run_streamed) sees the correct
@@ -10206,6 +10207,23 @@ def _cmd_update_pull_new_version(args, gateway_mode: bool) -> bool:
         )
         current_branch = result.stdout.strip()
 
+        # Capture the HEAD SHA before any branch-switching checkout. When the
+        # update uses ``git checkout -B <branch> origin/<branch>`` (the fallback
+        # for a missing local branch on a detached HEAD), the checkout itself
+        # IS the effective "pull" — it resets HEAD to origin/<branch>. After
+        # that, ``HEAD..origin/<branch>`` is always 0, falsely triggering the
+        # "already up to date" path and skipping all post-pull processing.
+        # Comparing the pre-checkout SHA against origin/<branch> instead of
+        # HEAD against origin/<branch> fixes this.
+        pre_checkout_sha = subprocess.run(
+            git_cmd + ["rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        used_checkout_b = False
+
         # Determine the target branch. Default is "main" (the long-standing
         # CLI behavior); --branch overrides for callers that want to update
         # against a non-default channel.
@@ -10263,6 +10281,10 @@ def _cmd_update_pull_new_version(args, gateway_mode: bool) -> bool:
                     if track_result.stderr.strip():
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
+                # ``checkout -B`` moved HEAD to ``origin/<branch>``, so the
+                # subsequent ``HEAD..origin/<branch>`` comparison would be 0.
+                # Flag this so we use ``pre_checkout_sha`` instead.
+                used_checkout_b = True
         else:
             # On a managed (non-fork) clone the user never edits the source
             # tree, so any dirt is git artifact (CRLF, lockfile churn,
@@ -10282,13 +10304,26 @@ def _cmd_update_pull_new_version(args, gateway_mode: bool) -> bool:
         )
 
         # Check if there are updates
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        if used_checkout_b:
+            # After ``git checkout -B <branch> origin/<branch>``, HEAD equals
+            # ``origin/<branch>`` so ``HEAD..origin/<branch>`` is always 0.
+            # Compare the pre-checkout HEAD against origin/<branch> instead
+            # to correctly detect new commits that arrived on the remote.
+            result = subprocess.run(
+                git_cmd + ["rev-list", f"{pre_checkout_sha}..origin/{branch}", "--count"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        else:
+            result = subprocess.run(
+                git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
         commit_count = int(result.stdout.strip())
 
         if commit_count == 0:
