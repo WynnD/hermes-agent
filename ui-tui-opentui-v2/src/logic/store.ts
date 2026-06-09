@@ -482,6 +482,9 @@ export function createSessionStore() {
     switch (event.type) {
       case 'gateway.ready':
         setState('ready', true)
+        // Clear any transient status: on a recovery-respawn ready this drops the
+        // lingering 'gateway recovering (attempt N)…' line; no-op on first connect.
+        setState('status', undefined)
         setSkin(event.payload?.skin)
         break
       case 'skin.changed':
