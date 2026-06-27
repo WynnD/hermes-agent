@@ -964,8 +964,10 @@ class TestUsageFromSanitizedResponse:
         monkeypatch.setitem(mod._TRACE_STATE, mod._trace_key("task-1", "session-1"), state)
         captured = {}
 
-        def fake_end_observation(obs, *, output=None, metadata=None, usage_details=None, cost_details=None):
+        def fake_end_observation(obs, *, output=None, metadata=None, usage_details=None,
+                                  cost_details=None, completion_start_time=None):
             captured["usage_details"] = usage_details
+            captured["completion_start_time"] = completion_start_time
 
         monkeypatch.setattr(mod, "_end_observation", fake_end_observation)
         return captured
@@ -1021,3 +1023,104 @@ class TestUsageFromSanitizedResponse:
 
         assert seen["resp"] is resp
         assert captured["usage_details"] == {"input": 7, "output": 3}
+
+    def test_ttft_with_started_at_sets_completion_start_time(self, monkeypatch):
+        """ttft + started_at should produce a UTC datetime completion_start_time."""
+        import sys as _sys
+        _sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        captured = self._setup(mod, monkeypatch)
+
+        mod.on_post_llm_call(
+            task_id="task-1",
+            session_id="session-1",
+            api_call_count=1,
+            model="deepseek-v4-flash",
+            response={"model": "deepseek-v4-flash"},
+            usage={"input_tokens": 100, "output_tokens": 20},
+            assistant_content_chars=42,
+            ttft=0.523,
+            started_at=1_000_000.0,
+        )
+
+        cst = captured["completion_start_time"]
+        assert cst is not None
+        # 1_000_000 + 0.523 = 1000000.523 → datetime
+        assert cst.year >= 1970
+        assert cst.tzinfo is not None  # timezone-aware
+        # Verify the timestamp is correct: epoch 1000000.523
+        assert abs(cst.timestamp() - 1_000_000.523) < 0.001
+
+    def test_no_ttft_leaves_completion_start_time_none(self, monkeypatch):
+        """Without ttft, completion_start_time should remain None."""
+        import sys as _sys
+        _sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        captured = self._setup(mod, monkeypatch)
+
+        mod.on_post_llm_call(
+            task_id="task-1",
+            session_id="session-1",
+            api_call_count=1,
+            model="deepseek-v4-flash",
+            response={"model": "deepseek-v4-flash"},
+            usage={"input_tokens": 100, "output_tokens": 20},
+            assistant_content_chars=42,
+            # ttft not passed
+        )
+
+        assert captured["completion_start_time"] is None
+
+    def test_ttft_zero_skipped(self, monkeypatch):
+        """Zero ttft should be treated as absent."""
+        import sys as _sys
+        _sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        captured = self._setup(mod, monkeypatch)
+
+        mod.on_post_llm_call(
+            task_id="task-1",
+            session_id="session-1",
+            api_call_count=1,
+            model="deepseek-v4-flash",
+            response={"model": "deepseek-v4-flash"},
+            usage={"input_tokens": 100, "output_tokens": 20},
+            assistant_content_chars=42,
+            ttft=0.0,
+            started_at=1_000_000.0,
+        )
+
+        assert captured["completion_start_time"] is None
+
+    def test_ttft_recorded_in_metadata(self, monkeypatch):
+        """ttft_s should appear in generation metadata when ttft is positive."""
+        import sys as _sys
+        _sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        captured = {}
+
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+        observation = object()
+        state = mod.TraceState(trace_id="trace-1", root_ctx=None, root_span=None)
+        state.generations[mod._request_key(1)] = observation
+        monkeypatch.setitem(mod._TRACE_STATE, mod._trace_key("task-1", "session-1"), state)
+
+        def fake_end_observation(obs, *, output=None, metadata=None, **kw):
+            captured["metadata"] = metadata
+
+        monkeypatch.setattr(mod, "_end_observation", fake_end_observation)
+
+        mod.on_post_llm_call(
+            task_id="task-1",
+            session_id="session-1",
+            api_call_count=1,
+            model="deepseek-v4-flash",
+            response={"model": "deepseek-v4-flash"},
+            usage={"input_tokens": 100, "output_tokens": 20},
+            assistant_content_chars=42,
+            ttft=0.523,
+            started_at=1_000_000.0,
+        )
+
+        assert captured["metadata"] is not None
+        assert captured["metadata"].get("ttft_s") == 0.523

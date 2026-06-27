@@ -54,15 +54,6 @@ class TraceState:
 
 _STATE_LOCK = threading.Lock()
 _TRACE_STATE: Dict[str, TraceState] = {}
-# Hard cap on live trace state. Each turn keys _TRACE_STATE by a unique
-# turn_id, and an entry is normally reclaimed by _finish_trace when a turn
-# ends cleanly (final response has content and no tool calls). A turn that
-# never reaches that state — interrupted, a tool-only final step, or empty
-# final content — would otherwise linger forever, so over the cap we evict
-# the least-recently-updated entries (ending their root span first). The cap
-# is far above any realistic concurrent-live-turn working set; it exists only
-# to bound the leak from non-finalizing turns, not to limit concurrency.
-_MAX_TRACE_STATE = 256
 _LANGFUSE_CLIENT = None
 _READ_FILE_LINE_RE = re.compile(r"^\s*(\d+)\|(.*)$")
 _READ_FILE_HEAD_LINES = 25
@@ -228,41 +219,12 @@ def _get_langfuse() -> Optional[Langfuse]:
     return _LANGFUSE_CLIENT
 
 
-def _scope_prefix(task_id: str, session_id: str) -> str:
-    """The task/session/thread prefix shared by every trace-key shape."""
+def _trace_key(task_id: str, session_id: str) -> str:
     if task_id:
-        return f"task:{task_id}"
+        return task_id
     if session_id:
         return f"session:{session_id}"
     return f"thread:{threading.get_ident()}"
-
-
-def _trace_key(
-    task_id: str,
-    session_id: str,
-    *,
-    turn_id: str = "",
-    api_request_id: str = "",
-) -> str:
-    """Build a stable in-process trace scope key for one agent turn.
-
-    Older Hermes paths only expose ``task_id``/``session_id``. Newer paths
-    pass ``turn_id`` and ``api_request_id`` in LLM/tool hooks; when present,
-    they must scope trace state so concurrent requests sharing one task/session
-    never collide. ``turn_id`` is preferred over ``api_request_id`` so the
-    turn-level ``post_llm_call`` hook (which carries ``turn_id`` but no
-    ``api_request_id``) resolves to the same key as the request-level hooks.
-    """
-    if turn_id:
-        return f"{_scope_prefix(task_id, session_id)}:turn:{turn_id}"
-    if api_request_id:
-        return f"{_scope_prefix(task_id, session_id)}:api:{api_request_id}"
-    # Legacy shape: a bare ``task_id`` (NOT the ``task:`` prefix) when present,
-    # otherwise the session/thread prefix. Kept distinct for backward
-    # compatibility with keys minted before turn/request scoping existed.
-    if task_id:
-        return task_id
-    return _scope_prefix(task_id, session_id)
 
 
 def _is_base64_data_uri(value: str) -> bool:
@@ -601,15 +563,12 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
 
 
 def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
-                      api_mode: str, messages: Any, client: Langfuse,
-                      turn_id: str = "", api_request_id: str = "") -> TraceState:
+                      api_mode: str, messages: Any, client: Langfuse) -> TraceState:
     trace_id = client.create_trace_id(seed=f"{session_id or 'sessionless'}::{task_id or task_key}")
     trace_input = _extract_last_user_message(messages)
     metadata = {
         "source": "hermes",
         "task_id": task_id,
-        "turn_id": turn_id,
-        "api_request_id": api_request_id,
         "platform": platform,
         "provider": provider,
         "model": model,
@@ -681,7 +640,8 @@ def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, 
 
 
 def _end_observation(observation: Any, *, output: Any = None, metadata: Optional[dict] = None,
-                     usage_details: Optional[dict] = None, cost_details: Optional[dict] = None) -> None:
+                     usage_details: Optional[dict] = None, cost_details: Optional[dict] = None,
+                     completion_start_time: Any = None) -> None:
     if observation is None:
         return
     try:
@@ -694,6 +654,8 @@ def _end_observation(observation: Any, *, output: Any = None, metadata: Optional
             update_kwargs["usage_details"] = usage_details
         if cost_details:
             update_kwargs["cost_details"] = cost_details
+        if completion_start_time is not None:
+            update_kwargs["completion_start_time"] = completion_start_time
         if update_kwargs:
             observation.update(**update_kwargs)
         observation.end()
@@ -708,30 +670,6 @@ def _merge_trace_output(output: Any, state: TraceState) -> Any:
     merged = dict(output) if isinstance(output, dict) else {"content": output}
     merged["tool_calls"] = list(state.turn_tool_calls)
     return merged
-
-
-def _evict_stale_locked() -> None:
-    """Drop least-recently-updated trace state to make room for a new entry.
-
-    Caller MUST hold ``_STATE_LOCK`` and call this immediately before inserting
-    one new entry. Bounds the leak from turns that never reach ``_finish_trace``
-    (interrupted / tool-only final step / empty final content), whose unique
-    per-turn key would otherwise linger forever. We evict down to
-    ``_MAX_TRACE_STATE - 1`` so that the about-to-be-added entry leaves the dict
-    at ``_MAX_TRACE_STATE`` — a true ceiling. The evicted entry's root span is
-    ended so it is not left dangling on the Langfuse side.
-    """
-    over = len(_TRACE_STATE) - (_MAX_TRACE_STATE - 1)
-    if over <= 0:
-        return
-    # Oldest-first by last_updated_at; evict just enough to make room.
-    stale = sorted(_TRACE_STATE.items(), key=lambda kv: kv[1].last_updated_at)[:over]
-    for key, state in stale:
-        _TRACE_STATE.pop(key, None)
-        try:
-            state.root_span.end()
-        except Exception as exc:  # pragma: no cover - fail-open
-            _debug(f"evict stale trace failed: {exc}")
 
 
 def _finish_trace(task_key: str, *, output: Any = None) -> None:
@@ -777,8 +715,7 @@ def _request_key(api_call_count: Any) -> str:
 def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = "", model: str = "",
                     provider: str = "", base_url: str = "", api_mode: str = "",
                     api_call_count: int = 0, messages: Any = None, turn_type: str = "user",
-                    conversation_history: Any = None, user_message: Any = None,
-                    turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
+                    conversation_history: Any = None, user_message: Any = None, **_: Any) -> None:
     # Older Hermes branches used pre_llm_call for request-scoped tracing and
     # passed the actual API messages. Current Hermes also has a turn-scoped
     # pre_llm_call used for context injection; tracing that hook creates an
@@ -795,12 +732,7 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
     # pre_llm_call with API messages directly. Current Hermes fires
     # pre_llm_call for context injection (conversation_history/user_message,
     # no messages list) — tracing that would create orphan traces.
-    task_key = _trace_key(
-        task_id,
-        session_id,
-        turn_id=turn_id,
-        api_request_id=api_request_id,
-    )
+    task_key = _trace_key(task_id, session_id)
 
     with _STATE_LOCK:
         state = _TRACE_STATE.get(task_key)
@@ -815,10 +747,7 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
                 api_mode=api_mode,
                 messages=messages,
                 client=client,
-                turn_id=turn_id,
-                api_request_id=api_request_id,
             )
-            _evict_stale_locked()
             _TRACE_STATE[task_key] = state
         state.last_updated_at = time.time()
 
@@ -843,8 +772,6 @@ def on_pre_llm_request(
     max_tokens: Any = None,
     conversation_history: Any = None,
     user_message: Any = None,
-    turn_id: str = "",
-    api_request_id: str = "",
     **_: Any,
 ) -> None:
     client = _get_langfuse()
@@ -858,12 +785,7 @@ def on_pre_llm_request(
         user_message=user_message,
     )
 
-    task_key = _trace_key(
-        task_id,
-        session_id,
-        turn_id=turn_id,
-        api_request_id=api_request_id,
-    )
+    task_key = _trace_key(task_id, session_id)
     req_key = _request_key(api_call_count)
 
     with _STATE_LOCK:
@@ -879,10 +801,7 @@ def on_pre_llm_request(
                 api_mode=api_mode,
                 messages=input_messages,
                 client=client,
-                turn_id=turn_id,
-                api_request_id=api_request_id,
             )
-            _evict_stale_locked()
             _TRACE_STATE[task_key] = state
         state.last_updated_at = time.time()
         previous = state.generations.pop(req_key, None)
@@ -911,18 +830,13 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                      api_duration: float = 0.0, finish_reason: str = "",
                      usage: Any = None, assistant_content_chars: int = 0,
                      assistant_tool_call_count: int = 0, assistant_response: Any = None,
-                     turn_id: str = "", api_request_id: str = "",
+                     ttft: Optional[float] = None, started_at: Optional[float] = None,
                      **_: Any) -> None:
     client = _get_langfuse()
     if client is None:
         return
 
-    task_key = _trace_key(
-        task_id,
-        session_id,
-        turn_id=turn_id,
-        api_request_id=api_request_id,
-    )
+    task_key = _trace_key(task_id, session_id)
     req_key = _request_key(api_call_count)
 
     with _STATE_LOCK:
@@ -1025,12 +939,22 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
         gen_metadata["api_duration_s"] = round(api_duration, 3)
     if finish_reason:
         gen_metadata["finish_reason"] = finish_reason
+    if ttft is not None and ttft > 0:
+        gen_metadata["ttft_s"] = round(ttft, 3)
+    # Compute completion_start_time for Langfuse TTFT/tok/s display.
+    # started_at is the wall-clock epoch timestamp when the API call began;
+    # ttft is the client-measured seconds until the first streaming delta.
+    _cst = None
+    if ttft is not None and ttft > 0 and started_at is not None:
+        from datetime import datetime, timezone
+        _cst = datetime.fromtimestamp(started_at + ttft, tz=timezone.utc)
     _end_observation(
         generation,
         output=output,
         usage_details=usage_details,
         cost_details=cost_details,
         metadata=gen_metadata,
+        completion_start_time=_cst,
     )
 
     has_tools = _assistant_has_tool_calls(assistant_message) if assistant_message else (assistant_tool_call_count > 0)
@@ -1040,18 +964,12 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
 
 
 def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = "",
-                     session_id: str = "", tool_call_id: str = "",
-                     turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
+                     session_id: str = "", tool_call_id: str = "", **_: Any) -> None:
     client = _get_langfuse()
     if client is None:
         return
 
-    task_key = _trace_key(
-        task_id,
-        session_id,
-        turn_id=turn_id,
-        api_request_id=api_request_id,
-    )
+    task_key = _trace_key(task_id, session_id)
 
     with _STATE_LOCK:
         state = _TRACE_STATE.get(task_key)
@@ -1072,14 +990,8 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
 
 
 def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = None,
-                      task_id: str = "", session_id: str = "", tool_call_id: str = "",
-                      turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
-    task_key = _trace_key(
-        task_id,
-        session_id,
-        turn_id=turn_id,
-        api_request_id=api_request_id,
-    )
+                      task_id: str = "", session_id: str = "", tool_call_id: str = "", **_: Any) -> None:
+    task_key = _trace_key(task_id, session_id)
     observation = None
 
     with _STATE_LOCK:

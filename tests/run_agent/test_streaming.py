@@ -269,6 +269,45 @@ class TestStreamingAccumulator:
         assert response.choices[0].message.content == "Let me check"
         assert len(response.choices[0].message.tool_calls) == 1
 
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_first_delta_sets_last_first_delta_at(self, mock_close, mock_create):
+        """_fire_first_delta should store wall-clock time on agent."""
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(content="Hello"),
+            _make_stream_chunk(content=" world", finish_reason="stop", model="test-model"),
+            _make_empty_chunk(usage=SimpleNamespace(prompt_tokens=10, completion_tokens=3)),
+        ]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        # Should start as None
+        assert getattr(agent, "_last_first_delta_at", None) is None
+
+        response = agent._interruptible_streaming_api_call({})
+
+        # Should be set after first delta (streaming stores it internally)
+        ts = getattr(agent, "_last_first_delta_at", None)
+        assert ts is not None, "first-delta timestamp should be set"
+        assert isinstance(ts, float), "should be a float (time.time())"
+        assert ts > 0, "should be a positive epoch timestamp"
+        assert response.choices[0].message.content == "Hello world"
+
 
 # ── Test: Streaming Callbacks ────────────────────────────────────────────
 
