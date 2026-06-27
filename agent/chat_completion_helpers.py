@@ -1816,16 +1816,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     _stream_stale_timeout = None
 
     def _fire_first_delta():
-        if not first_delta_fired["done"] and on_first_delta:
+        if not first_delta_fired["done"]:
             first_delta_fired["done"] = True
-            try:
-                on_first_delta()
-            except Exception:
-                pass
+            agent._last_first_delta_at = time.time()
+            if on_first_delta:
+                try:
+                    on_first_delta()
+                except Exception:
+                    pass
 
     def _call_chat_completions():
         """Stream a chat completions response."""
         import httpx as _httpx
+        # Clear any stale first-delta timestamp from a prior stream
+        agent._last_first_delta_at = None
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
         # wins over the HERMES_API_TIMEOUT env default if the user set it.
         _provider_timeout_cfg = get_provider_request_timeout(agent.provider, agent.model)

@@ -3805,6 +3805,8 @@ def run_conversation(
                     )
                     _assistant_text = assistant_message.content or ""
                     _api_ended_at = api_start_time + api_duration
+                    _last_first = getattr(agent, "_last_first_delta_at", None)
+                    _ttft = (_last_first - api_start_time) if _last_first else None
                     _invoke_hook(
                         "post_api_request",
                         task_id=effective_task_id,
@@ -3832,6 +3834,7 @@ def run_conversation(
                         assistant_message=assistant_message,
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),
+                        ttft=_ttft,
                     )
             except Exception:
                 pass
