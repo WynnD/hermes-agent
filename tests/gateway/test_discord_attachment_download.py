@@ -447,3 +447,93 @@ class TestHandleMessageUsesAuthenticatedRead:
         assert event.message_type == MessageType.AUDIO
         assert event.media_urls == ["/tmp/audio_from_read.ogg"]
         assert event.media_types == ["audio/ogg"]
+
+    @pytest.mark.asyncio
+    async def test_oversized_document_surfaces_explanation_to_agent(self, monkeypatch):
+        """Oversized attachments should not disappear as silent empty messages."""
+        adapter = DiscordAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="***",
+                extra={"max_attachment_bytes": 10},
+            )
+        )
+        adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
+        adapter.handle_message = AsyncMock()
+
+        from datetime import datetime, timezone
+
+        class _FakeDMChannel:
+            id = 100
+            name = "dm"
+
+        monkeypatch.setattr(
+            "plugins.platforms.discord.adapter.discord.DMChannel",
+            _FakeDMChannel,
+        )
+        chan = _FakeDMChannel()
+        att = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/fake/big.txt",
+            filename="big.txt",
+            content_type="text/plain",
+            size=11,
+            read=AsyncMock(return_value=b"this should not be read"),
+        )
+        msg = SimpleNamespace(
+            id=1, content="", attachments=[att], mentions=[],
+            reference=None,
+            created_at=datetime.now(timezone.utc),
+            channel=chan,
+            author=SimpleNamespace(id=42, display_name="U", name="U"),
+        )
+
+        await adapter._handle_message(msg)
+
+        att.read.assert_not_awaited()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.media_urls == []
+        assert "big.txt" in event.text
+        assert "configured cap is 10 bytes" in event.text
+
+    @pytest.mark.asyncio
+    async def test_unsupported_attachment_surfaces_explanation_to_agent(self, monkeypatch):
+        """Unsupported attachment types should tell the agent what happened."""
+        adapter = _make_adapter()
+        adapter._text_batch_delay_seconds = 0
+        adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
+        adapter.handle_message = AsyncMock()
+
+        from datetime import datetime, timezone
+
+        class _FakeDMChannel:
+            id = 100
+            name = "dm"
+
+        monkeypatch.setattr(
+            "plugins.platforms.discord.adapter.discord.DMChannel",
+            _FakeDMChannel,
+        )
+        chan = _FakeDMChannel()
+        att = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/fake/archive.rar",
+            filename="archive.rar",
+            content_type="application/vnd.rar",
+            size=123,
+            read=AsyncMock(return_value=b"not read"),
+        )
+        msg = SimpleNamespace(
+            id=1, content="", attachments=[att], mentions=[],
+            reference=None,
+            created_at=datetime.now(timezone.utc),
+            channel=chan,
+            author=SimpleNamespace(id=42, display_name="U", name="U"),
+        )
+
+        await adapter._handle_message(msg)
+
+        att.read.assert_not_awaited()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls == []
+        assert "archive.rar" in event.text
+        assert "not allowlisted" in event.text

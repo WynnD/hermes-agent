@@ -17,7 +17,7 @@ The active provider is chosen by configuration with this precedence:
 3. If exactly one capability-eligible provider is registered AND available,
    use it.
 4. Legacy preference order — ``firecrawl`` → ``parallel`` → ``tavily`` →
-   ``exa`` → ``searxng`` → ``brave-free`` → ``ddgs`` — filtered by
+   ``exa`` → ``searxng`` → ``brave-free`` → ``ddgs`` → ``native`` — filtered by
    availability. Matches the historic ``tools.web_tools._get_backend()``
    candidate order so installs that never set a config key keep landing
    on the same provider they did before the plugin migration.
@@ -127,6 +127,7 @@ _LEGACY_PREFERENCE = (
     "searxng",
     "brave-free",
     "ddgs",
+    "native",
 )
 
 

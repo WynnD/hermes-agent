@@ -2,7 +2,7 @@
 
 Covers:
 
-- All eight bundled plugins (brave-free, ddgs, searxng, exa, parallel,
+- All bundled plugins (brave-free, ddgs, searxng, exa, native, parallel,
   tavily, firecrawl, xai) instantiate and self-report the expected
   capabilities + ABC-derived defaults.
 - Each plugin's ``is_available()`` correctly reflects env-var presence.
@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
+import sys
+from typing import Any, Dict, List
 
 import pytest
 
@@ -68,7 +71,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestBundledPluginsRegister:
-    """All eight bundled web plugins discover and register correctly."""
+    """All bundled web plugins discover and register correctly."""
 
     def test_all_seven_plugins_present_in_registry(self) -> None:
         _ensure_plugins_loaded()
@@ -80,6 +83,7 @@ class TestBundledPluginsRegister:
             "ddgs",
             "exa",
             "firecrawl",
+            "native",
             "parallel",
             "searxng",
             "tavily",
@@ -87,17 +91,21 @@ class TestBundledPluginsRegister:
         ]
 
     @pytest.mark.parametrize(
-        "plugin_name,expected_search,expected_extract",
+        "plugin_name,expected_search,expected_extract,expected_crawl",
         [
-            ("brave-free", True, False),
-            ("ddgs", True, False),
-            ("searxng", True, False),
-            ("exa", True, True),
-            ("parallel", True, True),
-            ("tavily", True, True),
-            ("firecrawl", True, True),
+            ("brave-free", True, False, False),
+            ("ddgs", True, False, False),
+            ("searxng", True, False, False),
+            ("exa", True, True, False),
+            ("native", False, True, False),
+            ("parallel", True, True, False),
+            ("tavily", True, True, True),
+            # firecrawl: search + extract + crawl. Crawl was originally
+            # disabled in the migration (fell through to a legacy inline
+            # path); the follow-up commit enabled it natively.
+            ("firecrawl", True, True, True),
             # xai: search-only via Grok's agentic web_search tool.
-            ("xai", True, False),
+            ("xai", True, False, False),
         ],
     )
     def test_capability_flags_match_spec(
@@ -105,6 +113,7 @@ class TestBundledPluginsRegister:
         plugin_name: str,
         expected_search: bool,
         expected_extract: bool,
+        expected_crawl: bool,
     ) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import get_provider
@@ -113,10 +122,11 @@ class TestBundledPluginsRegister:
         assert provider is not None, f"plugin {plugin_name!r} not registered"
         assert provider.supports_search() is expected_search
         assert provider.supports_extract() is expected_extract
+        assert provider.supports_crawl() is expected_crawl
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        ["brave-free", "ddgs", "searxng", "exa", "native", "parallel", "tavily", "firecrawl", "xai"],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()
@@ -129,7 +139,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        ["brave-free", "ddgs", "searxng", "exa", "native", "parallel", "tavily", "firecrawl", "xai"],
     )
     def test_each_plugin_has_setup_schema(self, plugin_name: str) -> None:
         """``get_setup_schema()`` returns a dict the picker can consume."""
@@ -202,6 +212,14 @@ class TestIsAvailable:
         monkeypatch.setenv("PARALLEL_API_KEY", "real")
         assert p.is_available() is True
 
+    def test_native_is_available_without_credentials(self) -> None:
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        p = get_provider("native")
+        assert p is not None
+        assert p.is_available() is True
+
     def test_firecrawl_requires_either_key_or_url(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -265,7 +283,7 @@ class TestRegistryResolution:
         surfaces a precise "FOO_API_KEY is not set" error instead.
         """
         _ensure_plugins_loaded()
-        from agent.web_search_registry import _resolve
+        from agent.web_search_registry import _resolve, get_provider
 
         # No BRAVE_SEARCH_API_KEY (fixture cleared it).
         result = _resolve("brave-free", capability="search")
@@ -369,6 +387,103 @@ class TestAsyncExtractDispatch:
         assert p is not None
         assert inspect.iscoroutinefunction(p.extract) is False
 
+    def test_native_extract_is_sync(self) -> None:
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        p = get_provider("native")
+        assert p is not None
+        assert inspect.iscoroutinefunction(p.extract) is False
+
+
+class TestNativeExtractShape:
+    """Native local extraction returns the provider-standard document shape."""
+
+    def test_native_extract_uses_trafilatura_when_available(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from plugins.web.native.provider import NativeWebSearchProvider
+
+        html = """
+        <html><head><title>Ignored Browser Title</title></head>
+        <body><main><h1>Native Title</h1><p>Useful article body.</p></main></body></html>
+        """
+
+        monkeypatch.setattr(
+            "plugins.web.native.provider._fetch_html",
+            lambda url: (html, "text/html; charset=utf-8"),
+        )
+        monkeypatch.setattr(
+            "plugins.web.native.provider._extract_with_trafilatura",
+            lambda html, url: ("Native Title", "Useful article body.", "trafilatura"),
+        )
+
+        result = NativeWebSearchProvider().extract(["https://example.com/article"])
+
+        assert len(result) == 1
+        doc = result[0]
+        assert doc["url"] == "https://example.com/article"
+        assert doc["title"] == "Native Title"
+        assert doc["content"] == "Useful article body."
+        assert doc["raw_content"] == "Useful article body."
+        assert doc["metadata"]["extractor"] == "trafilatura"
+
+    def test_native_extract_falls_back_to_bs4_when_primary_extractors_miss(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from plugins.web.native.provider import NativeWebSearchProvider
+
+        html = """
+        <html><head><title>Fallback Title</title><script>ignored()</script></head>
+        <body><nav>menu</nav><article><h1>Fallback Title</h1>
+        <p>Fallback article body.</p></article><footer>bye</footer></body></html>
+        """
+
+        monkeypatch.setattr(
+            "plugins.web.native.provider._fetch_html",
+            lambda url: (html, "text/html"),
+        )
+        monkeypatch.setattr(
+            "plugins.web.native.provider._extract_with_trafilatura",
+            lambda html, url: None,
+        )
+        monkeypatch.setattr(
+            "plugins.web.native.provider._extract_with_readability",
+            lambda html, url: None,
+        )
+
+        result = NativeWebSearchProvider().extract(["https://example.com/fallback"])
+
+        assert result[0]["title"] == "Fallback Title"
+        assert "Fallback article body." in result[0]["content"]
+        assert "ignored" not in result[0]["content"]
+        assert result[0]["metadata"]["extractor"] == "beautifulsoup"
+
+    def test_native_extract_handles_pdf_text_without_article_extractors(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from plugins.web.native.provider import NativeWebSearchProvider
+
+        pdf_text = "# PDF Title\n\n## Page 1\n\nExtracted paper body."
+        monkeypatch.setattr(
+            "plugins.web.native.provider._fetch_html",
+            lambda url: (pdf_text, "application/pdf"),
+        )
+
+        result = NativeWebSearchProvider().extract(["https://example.com/paper.pdf"])
+
+        assert result[0]["title"] == "PDF Title"
+        assert "Extracted paper body." in result[0]["content"]
+        assert result[0]["metadata"]["extractor"] == "pymupdf"
+
+    def test_native_pdf_detection_uses_content_type_extension_and_magic_bytes(self) -> None:
+        from plugins.web.native.provider import _looks_like_pdf
+
+        assert _looks_like_pdf("https://example.com/download", "application/pdf")
+        assert _looks_like_pdf("https://example.com/paper.PDF", "")
+        assert _looks_like_pdf("https://example.com/download", "application/octet-stream", b"%PDF-1.7")
+        assert not _looks_like_pdf("https://example.com/index.html", "text/html", b"<html>")
+
 
 # ---------------------------------------------------------------------------
 # Error response shape (preserved bit-for-bit from legacy)
@@ -449,41 +564,37 @@ class TestErrorResponseShapes:
         if result:  # if anything came back, it should be an error entry
             assert "error" in result[0]
 
-    def test_firecrawl_config_error_points_paid_users_to_nous_subscription(self, monkeypatch):
-        from plugins.web.firecrawl import provider as firecrawl_provider
+    def test_tavily_crawl_returns_error_dict_when_unconfigured(self) -> None:
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
 
-        monkeypatch.setattr(
-            "tools.web_tools.managed_nous_tools_enabled",
-            lambda: True,
-            raising=False,
-        )
+        p = get_provider("tavily")
+        assert p is not None
+        result = p.crawl("https://example.com")
+        assert isinstance(result, dict)
+        assert "results" in result
+        assert isinstance(result["results"], list)
+        if result["results"]:
+            assert "error" in result["results"][0]
 
-        with pytest.raises(ValueError) as exc_info:
-            firecrawl_provider._raise_web_backend_configuration_error()
+    def test_firecrawl_crawl_returns_error_dict_when_unconfigured(self):
+        """firecrawl crawl is async (wraps SDK in to_thread); error must be
+        surfaced via the per-page result shape, not raised."""
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
 
-        message = str(exc_info.value)
-        assert "With your Nous subscription you can also use the Tool Gateway" in message
-        assert "select Nous Subscription as the web provider" in message
-        assert "managed Firecrawl web tools is unavailable" not in message
-
-    def test_firecrawl_config_error_uses_entitlement_message_when_not_paid(self, monkeypatch):
-        from plugins.web.firecrawl import provider as firecrawl_provider
-
-        monkeypatch.setattr(
-            "tools.web_tools.managed_nous_tools_enabled",
-            lambda: False,
-            raising=False,
-        )
-        monkeypatch.setattr(
-            "tools.web_tools.nous_tool_gateway_unavailable_message",
-            lambda capability: f"{capability} denied by test entitlement.",
-            raising=False,
-        )
-
-        with pytest.raises(ValueError) as exc_info:
-            firecrawl_provider._raise_web_backend_configuration_error()
-
-        assert "managed Firecrawl web tools denied by test entitlement" in str(exc_info.value)
+        p = get_provider("firecrawl")
+        assert p is not None
+        assert inspect.iscoroutinefunction(p.crawl)
+        result = asyncio.run(p.crawl("https://example.com"))
+        assert isinstance(result, dict)
+        assert "results" in result
+        assert isinstance(result["results"], list)
+        # Without FIRECRAWL_API_KEY, the plugin's _get_firecrawl_client()
+        # raises ValueError which is caught and returned as a per-page error.
+        assert len(result["results"]) >= 1
+        assert "error" in result["results"][0]
+        assert result["results"][0]["url"] == "https://example.com"
 
     def test_xai_search_returns_error_dict_when_unconfigured(self) -> None:
         """xAI returns a typed error dict (no XAI_API_KEY)."""

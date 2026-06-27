@@ -17,6 +17,7 @@ from tools.homeassistant_tool import (
     _get_headers,
     _handle_get_state,
     _handle_call_service,
+    _run_async,
     _BLOCKED_DOMAINS,
     _ENTITY_ID_RE,
     _SERVICE_NAME_RE,
@@ -170,6 +171,23 @@ class TestParseServiceResponse:
         result = _parse_service_response("script", "run", {"result": "ok"})
         assert result["success"] is True
         assert result["affected_entities"] == []
+        assert result["response"] is None
+
+    def test_response_service_data_preserved(self):
+        ha_response = {
+            "changed_states": [],
+            "service_response": {
+                "todo.hermes": {
+                    "items": [
+                        {"summary": "Clean cat pan", "status": "needs_action"}
+                    ]
+                }
+            },
+        }
+        result = _parse_service_response("todo", "get_items", ha_response)
+        assert result["success"] is True
+        assert result["affected_entities"] == []
+        assert result["response"]["todo.hermes"]["items"][0]["summary"] == "Clean cat pan"
 
     def test_none_response(self):
         result = _parse_service_response("automation", "trigger", None)
@@ -357,6 +375,35 @@ class TestCallServiceStringData:
             "data": "   ",
         })
         mock_run.assert_called_once()
+
+
+    @patch("aiohttp.ClientSession")
+    def test_get_items_uses_return_response(self, mock_session):
+        from tools.homeassistant_tool import _async_call_service
+
+        class Resp:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            def raise_for_status(self):
+                pass
+            async def json(self):
+                return {"changed_states": [], "service_response": {"todo.hermes": {"items": []}}}
+
+        class Session:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            def post(self, url, **kwargs):
+                self.url = url
+                return Resp()
+
+        session = Session()
+        mock_session.return_value = session
+        _run_async(_async_call_service("todo", "get_items", "todo.hermes"))
+        assert session.url.endswith("/api/services/todo/get_items?return_response")
 
 
 # ---------------------------------------------------------------------------
