@@ -1006,6 +1006,21 @@ export function DesktopController() {
     }
   }, [gatewayState, refreshCurrentModel, refreshSessions])
 
+  // "Hey Hermes" wake word: arm the server-side detector for this surface
+  // (gated on config) and open a fresh session when it fires. Idempotent and
+  // self-cleaning across reconnects.
+  useEffect(() => {
+    if (gatewayState !== 'open') {
+      return
+    }
+    void requestGateway('wake.start', { surface: 'gui' }).catch(() => undefined)
+    const gw = gatewayRef.current
+    if (!gw) {
+      return
+    }
+    return gw.on('wake.detected', () => startFreshSessionDraft())
+  }, [gatewayState, requestGateway, gatewayRef, startFreshSessionDraft])
+
   // Keep the cron jobs section live without a user action: the scheduler ticks
   // in the background (advancing next-run/state and creating runs), so poll the
   // job list on an interval (and on tab re-focus) while connected.
