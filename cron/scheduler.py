@@ -836,6 +836,18 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
                 }
         return None
 
+    if deliver_value == "last_active":
+        from cron.last_active import get_most_recent_active
+
+        entry = get_most_recent_active()
+        if entry:
+            return {
+                "platform": entry["platform"],
+                "chat_id": str(entry["chat_id"]),
+                "thread_id": entry.get("thread_id"),
+            }
+        # No last-active data — fall through to home-channel resolution below.
+
     if ":" in deliver_value:
         platform_name, rest = deliver_value.split(":", 1)
         platform_key = platform_name.lower()

@@ -7837,7 +7837,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
-        
+
+        # Track last-active conversation for cron deliver="last_active".
+        # Write on every real, authorized, non-internal message so the
+        # cron scheduler knows where the user is most recently reachable.
+        if not is_internal:
+            try:
+                from cron.last_active import write_last_active
+
+                _plat = (
+                    source.platform.value
+                    if hasattr(source.platform, "value")
+                    else str(source.platform)
+                )
+                write_last_active(_plat, source.chat_id, source.thread_id)
+            except Exception:
+                logger.debug("Failed to write last_active", exc_info=True)
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
