@@ -35,7 +35,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional, Dict, Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from utils import is_truthy_value
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
@@ -1340,8 +1340,9 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
     if not _HAS_OPENAI:
         return {"success": False, "transcript": "", "error": "openai package not installed"}
 
-    # Auto-correct model if caller passed a Groq-only model
-    if model_name in GROQ_MODELS:
+    # Auto-correct model if caller passed a Groq-only model to the official
+    # OpenAI API. Custom OpenAI-compatible STT endpoints may expose those names.
+    if model_name in GROQ_MODELS and _is_official_openai_base_url(base_url):
         logger.info("Model %s not available on OpenAI, using %s", model_name, DEFAULT_STT_MODEL)
         model_name = DEFAULT_STT_MODEL
 
@@ -1778,6 +1779,10 @@ def _resolve_openai_audio_client_config() -> tuple[str, str]:
     return managed_gateway.nous_user_token, urljoin(
         f"{managed_gateway.gateway_origin.rstrip('/')}/", "v1"
     )
+
+
+def _is_official_openai_base_url(base_url: str) -> bool:
+    return urlparse(str(base_url or "")).hostname == "api.openai.com"
 
 
 def _extract_transcript_text(transcription: Any) -> str:
