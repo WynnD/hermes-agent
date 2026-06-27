@@ -109,6 +109,13 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "search.exa": ("exa-py==2.10.2",),
     "search.firecrawl": ("firecrawl-py==4.17.0",),
     "search.parallel": ("parallel-web==0.4.2",),
+    "search.native": (
+        "trafilatura==2.0.0",
+        "readability-lxml==0.8.4.1",
+        "beautifulsoup4==4.14.3",
+        "markdownify==1.2.2",
+        "PyMuPDF==1.26.7",
+    ),
 
     # ─── TTS providers ─────────────────────────────────────────────────────
     # Pinned to exact versions to match pyproject.toml's no-ranges policy
