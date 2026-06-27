@@ -80,6 +80,7 @@ class TestBundledPluginsRegister:
             "ddgs",
             "exa",
             "firecrawl",
+            "native",
             "parallel",
             "searxng",
             "tavily",
@@ -93,6 +94,7 @@ class TestBundledPluginsRegister:
             ("ddgs", True, False),
             ("searxng", True, False),
             ("exa", True, True),
+            ("native", False, True),
             ("parallel", True, True),
             ("tavily", True, True),
             ("firecrawl", True, True),
@@ -116,7 +118,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        ["brave-free", "ddgs", "searxng", "exa", "native", "parallel", "tavily", "firecrawl", "xai"],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()
@@ -129,7 +131,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        ["brave-free", "ddgs", "searxng", "exa", "native", "parallel", "tavily", "firecrawl", "xai"],
     )
     def test_each_plugin_has_setup_schema(self, plugin_name: str) -> None:
         """``get_setup_schema()`` returns a dict the picker can consume."""
@@ -200,6 +202,14 @@ class TestIsAvailable:
         assert p is not None
         assert p.is_available() is False
         monkeypatch.setenv("PARALLEL_API_KEY", "real")
+        assert p.is_available() is True
+
+    def test_native_is_available_without_credentials(self) -> None:
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        p = get_provider("native")
+        assert p is not None
         assert p.is_available() is True
 
     def test_firecrawl_requires_either_key_or_url(

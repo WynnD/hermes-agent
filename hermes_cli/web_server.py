@@ -504,7 +504,11 @@ async def auth_middleware(request: Request, call_next):
     # and is skipped here so the gate's session attachment isn't overridden.
     if getattr(request.app.state, "auth_required", False):
         return await call_next(request)
-    path = request.url.path
+    # Use the ASGI request path, not request.url.path. CVE-2026-48710
+    # (BadHost) lets malformed Host headers poison request.url.path in
+    # vulnerable Starlette versions; scope["path"] is the routed path from
+    # the HTTP request line and cannot be forged via Host.
+    path = request.scope.get("path", "")
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
         if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
             return JSONResponse(
