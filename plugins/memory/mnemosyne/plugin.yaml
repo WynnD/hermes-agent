@@ -1,0 +1,3 @@
+name: mnemosyne
+description: Local-first SQLite-backed Mnemosyne memory provider for Hermes.
+version: 1.0.0

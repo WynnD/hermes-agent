@@ -4,6 +4,7 @@ Tests real logic: entity filtering, payload building, response parsing,
 handler validation, and availability gating.
 """
 
+import asyncio
 import json
 from unittest.mock import patch
 
@@ -170,6 +171,23 @@ class TestParseServiceResponse:
         result = _parse_service_response("script", "run", {"result": "ok"})
         assert result["success"] is True
         assert result["affected_entities"] == []
+        assert result["response"] is None
+
+    def test_response_service_data_preserved(self):
+        ha_response = {
+            "changed_states": [],
+            "service_response": {
+                "todo.hermes": {
+                    "items": [
+                        {"summary": "Clean cat pan", "status": "needs_action"}
+                    ]
+                }
+            },
+        }
+        result = _parse_service_response("todo", "get_items", ha_response)
+        assert result["success"] is True
+        assert result["affected_entities"] == []
+        assert result["response"]["todo.hermes"]["items"][0]["summary"] == "Clean cat pan"
 
     def test_none_response(self):
         result = _parse_service_response("automation", "trigger", None)
@@ -323,7 +341,8 @@ class TestCallServiceStringData:
             "data": '{"hvac_mode": "heat"}',
         })
         call_args = mock_run.call_args[0][0]  # the coroutine arg
-        # _run_async was called, meaning we got past validation
+        # _run_async was called, meaning we got past validation.
+        call_args.close()
 
     @patch("tools.homeassistant_tool._run_async", return_value={"success": True})
     def test_dict_data_passthrough(self, mock_run):
@@ -335,6 +354,7 @@ class TestCallServiceStringData:
             "data": {"brightness": 255},
         })
         mock_run.assert_called_once()
+        mock_run.call_args[0][0].close()
 
     def test_invalid_json_string_returns_error(self):
         """Malformed JSON string in data returns a clear error."""
@@ -357,6 +377,36 @@ class TestCallServiceStringData:
             "data": "   ",
         })
         mock_run.assert_called_once()
+        mock_run.call_args[0][0].close()
+
+
+    @patch("aiohttp.ClientSession")
+    def test_get_items_uses_return_response(self, mock_session):
+        from tools.homeassistant_tool import _async_call_service
+
+        class Resp:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            def raise_for_status(self):
+                pass
+            async def json(self):
+                return {"changed_states": [], "service_response": {"todo.hermes": {"items": []}}}
+
+        class Session:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            def post(self, url, **kwargs):
+                self.url = url
+                return Resp()
+
+        session = Session()
+        mock_session.return_value = session
+        asyncio.run(_async_call_service("todo", "get_items", "todo.hermes"))
+        assert session.url.endswith("/api/services/todo/get_items?return_response")
 
 
 # ---------------------------------------------------------------------------

@@ -681,7 +681,8 @@ def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, 
 
 
 def _end_observation(observation: Any, *, output: Any = None, metadata: Optional[dict] = None,
-                     usage_details: Optional[dict] = None, cost_details: Optional[dict] = None) -> None:
+                     usage_details: Optional[dict] = None, cost_details: Optional[dict] = None,
+                     completion_start_time: Any = None) -> None:
     if observation is None:
         return
     try:
@@ -694,6 +695,8 @@ def _end_observation(observation: Any, *, output: Any = None, metadata: Optional
             update_kwargs["usage_details"] = usage_details
         if cost_details:
             update_kwargs["cost_details"] = cost_details
+        if completion_start_time is not None:
+            update_kwargs["completion_start_time"] = completion_start_time
         if update_kwargs:
             observation.update(**update_kwargs)
         observation.end()
@@ -912,6 +915,7 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                      usage: Any = None, assistant_content_chars: int = 0,
                      assistant_tool_call_count: int = 0, assistant_response: Any = None,
                      turn_id: str = "", api_request_id: str = "",
+                     ttft: Optional[float] = None, started_at: Optional[float] = None,
                      **_: Any) -> None:
     client = _get_langfuse()
     if client is None:
@@ -1025,12 +1029,22 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
         gen_metadata["api_duration_s"] = round(api_duration, 3)
     if finish_reason:
         gen_metadata["finish_reason"] = finish_reason
+    if ttft is not None and ttft > 0:
+        gen_metadata["ttft_s"] = round(ttft, 3)
+    # Compute completion_start_time for Langfuse TTFT/tok/s display.
+    # started_at is the wall-clock epoch timestamp when the API call began;
+    # ttft is the client-measured seconds until the first streaming delta.
+    _cst = None
+    if ttft is not None and ttft > 0 and started_at is not None:
+        from datetime import datetime, timezone
+        _cst = datetime.fromtimestamp(started_at + ttft, tz=timezone.utc)
     _end_observation(
         generation,
         output=output,
         usage_details=usage_details,
         cost_details=cost_details,
         metadata=gen_metadata,
+        completion_start_time=_cst,
     )
 
     has_tools = _assistant_has_tool_calls(assistant_message) if assistant_message else (assistant_tool_call_count > 0)

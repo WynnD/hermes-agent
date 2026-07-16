@@ -157,15 +157,29 @@ class TestMemoryManagerUserIdThreading:
 class TestMem0UserIdScoping:
     """Verify Mem0 plugin uses gateway user_id when provided."""
 
-    def test_gateway_user_id_overrides_default(self):
-        """When user_id is passed via kwargs, it should override the config default."""
+    def test_config_user_id_overrides_gateway_user_id(self):
+        """Configured user_id is canonical across gateway surfaces."""
         from plugins.memory.mem0 import Mem0MemoryProvider
 
         provider = Mem0MemoryProvider()
-        # Mock _load_config to return a config with default user_id
         with patch("plugins.memory.mem0._load_config", return_value={
             "api_key": "test-key",
-            "user_id": "hermes-user",
+            "user_id": "wynn",
+            "agent_id": "hermes",
+            "rerank": True,
+        }):
+            provider.initialize(session_id="test-sess", user_id="tg_user_99")
+
+        assert provider._user_id == "wynn"
+
+    def test_gateway_user_id_used_when_no_config_user_id(self):
+        """Multi-user deployments still get per-user buckets without a canonical config user_id."""
+        from plugins.memory.mem0 import Mem0MemoryProvider
+
+        provider = Mem0MemoryProvider()
+        with patch("plugins.memory.mem0._load_config", return_value={
+            "api_key": "test-key",
+            "user_id": "",
             "agent_id": "hermes",
             "rerank": True,
         }):
@@ -218,9 +232,8 @@ class TestMem0UserIdScoping:
             p1.initialize(session_id="sess-1", user_id="alice_123")
             p2.initialize(session_id="sess-2", user_id="bob_456")
 
-        assert p1._user_id == "alice_123"
-        assert p2._user_id == "bob_456"
-        assert p1._user_id != p2._user_id
+        assert p1._user_id == "hermes-user"
+        assert p2._user_id == "hermes-user"
 
 
 # ---------------------------------------------------------------------------

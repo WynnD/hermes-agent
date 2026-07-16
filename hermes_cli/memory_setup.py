@@ -456,8 +456,12 @@ def cmd_status(args) -> None:
             else:
                 print("  Status:    not available ✗")
                 schema = provider.get_config_schema() if hasattr(provider, "get_config_schema") else []
-                # Check all fields that have env_var (both secret and non-secret)
-                required_fields = [f for f in schema if f.get("env_var")]
+                # Check fields that are actually required. Optional
+                # connection fields such as MEM0_API_KEY and
+                # MEM0_BASE_URL may be alternatives for self-hosted
+                # providers, so listing all env_var fields as
+                # "missing" produces false failures.
+                required_fields = [f for f in schema if f.get("env_var") and f.get("required")]
                 if required_fields:
                     print("  Missing:")
                     for f in required_fields:
