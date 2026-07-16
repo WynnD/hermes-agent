@@ -134,6 +134,14 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
+
+# Review-lanes handoff constants.  When an implementation task is blocked with
+# a ``review-required:`` reason, a reviewer-assignee child may proceed even
+# though the parent is not yet ``done`` — the review lane inspects the PR that
+# the worker produced instead of waiting for the parent to complete.
+_REVIEW_HANDOFF_PREFIX = "review-required:"
+_REVIEW_ASSIGNEES = {"reviewer"}
+
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
@@ -2596,13 +2604,16 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're todo.
-                        rows = conn.execute(
-                            "SELECT status FROM tasks WHERE id IN "
-                            "(" + ",".join("?" * len(parents)) + ")",
-                            parents,
-                        ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
+                        # If any parent is not yet satisfied, we're todo.
+                        # Reviewer tasks are special: an implementation task
+                        # blocked with a `review-required:` handoff has done
+                        # its implementation job and should unblock the review
+                        # lane without pretending the implementation is fully
+                        # done/merged. See _parent_satisfies_child().
+                        if not all(
+                            _parent_satisfies_child(conn, parent_id=pid, child_assignee=assignee)
+                            for pid in parents
+                        ):
                             task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
@@ -2826,11 +2837,15 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
         )
-        # If child was ready but parent is not yet done, demote child to todo.
-        parent_status = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (parent_id,)
-        ).fetchone()["status"]
-        if parent_status != "done":
+        # If child was ready but the new parent does not satisfy its lane,
+        # demote child to todo. Reviewer children may accept a parent blocked
+        # with `review-required:`; normal children still require done/archived.
+        child = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (child_id,)
+        ).fetchone()
+        if not _parent_satisfies_child(
+            conn, parent_id=parent_id, child_assignee=child["assignee"] if child else None,
+        ):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
@@ -3352,6 +3367,78 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
+
+def _latest_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return the most recent structured block reason for a task, if any."""
+    row = conn.execute(
+        """
+        SELECT payload
+          FROM task_events
+         WHERE task_id = ?
+           AND kind = 'blocked'
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return ""
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        return ""
+    if isinstance(payload, dict):
+        return str(payload.get("reason") or "")
+    return ""
+
+
+def _parent_satisfies_child(
+    conn: sqlite3.Connection,
+    *,
+    parent_id: str,
+    child_assignee: Optional[str],
+) -> bool:
+    """Return whether a parent dependency is satisfied for a child task.
+
+    Normal children wait for parents to be done/archived. Reviewer-lane children
+    may also proceed when an implementation parent is blocked with a
+    ``review-required:`` handoff. That state means the implementation worker
+    produced a PR/artifact and deliberately stopped before merge; the review card
+    is exactly the next step. Keeping the parent blocked preserves the
+    anti-fake-done contract while allowing the review conveyor to move.
+    """
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (parent_id,),
+    ).fetchone()
+    if not row:
+        return False
+    status = row["status"]
+    if status in {"done", "archived"}:
+        return True
+    if (
+        status == "blocked"
+        and (child_assignee or "") in _REVIEW_ASSIGNEES
+        and _latest_block_reason(conn, parent_id).startswith(_REVIEW_HANDOFF_PREFIX)
+    ):
+        return True
+    return False
+
+
+def _all_parents_satisfy_child(conn: sqlite3.Connection, task_id: str) -> bool:
+    child = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not child:
+        return False
+    parents = parent_ids(conn, task_id)
+    return all(
+        _parent_satisfies_child(conn, parent_id=pid, child_assignee=child["assignee"])
+        for pid in parents
+    )
+
+
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
     worker/operator ``kanban_block`` call (#28712).
@@ -3444,7 +3531,7 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if _all_parents_satisfy_child(conn, task_id):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -3498,20 +3585,14 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
-        # parent is not yet 'done'. This is the single enforcement point
+        # parent is not satisfied. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
         # release_stale_claims, manual SQL) set status='ready'. If a racy
-        # writer promoted a task with undone parents, demote it back to
+        # writer promoted a task with unsatisfied parents, demote it back to
         # 'todo' here — recompute_ready will re-promote when the parents
-        # actually finish. See RCA at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if undone:
+        # actually finish. Reviewer children may accept a parent blocked with
+        # ``review-required:``; normal children still require done/archived.
+        if not _all_parents_satisfy_child(conn, task_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -5085,6 +5166,9 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
+    # Recompute parent satisfaction after blocking: a review-required handoff
+    # on this task may unblock waiting reviewer children.
+    recompute_ready(conn)
     return True
 
 
@@ -5187,19 +5271,14 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        # Re-gate on parent completion before flipping 'blocked' back to
+        # Re-gate on parent satisfaction before flipping 'blocked' back to
         # 'ready'. Unconditionally setting status='ready' here bypasses the
         # parent-completion invariant (the dispatcher trusts that column);
         # if parents are still in progress the task must wait in 'todo'
-        # until recompute_ready picks it up. RCA: Bug 2 at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone_parents = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
+        # until recompute_ready picks it up. Reviewer children may accept
+        # a parent blocked with ``review-required:``; normal children
+        # still require done/archived.
+        new_status = "ready" if _all_parents_satisfy_child(conn, task_id) else "todo"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run

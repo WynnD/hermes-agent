@@ -364,6 +364,41 @@ def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
         assert kb.get_task(conn, c).status == "ready"
 
 
+def test_reviewer_child_promotes_when_parent_blocked_review_required(kanban_home):
+    with kb.connect() as conn:
+        impl = kb.create_task(conn, title="impl", assignee="qwencoder")
+        review = kb.create_task(conn, title="review", assignee="reviewer", parents=[impl])
+
+        kb.block_task(conn, impl, reason="review-required: PR #123 open")
+
+        assert kb.get_task(conn, review).status == "ready"
+        claimed = kb.claim_task(conn, review, claimer="host:reviewer")
+        assert claimed is not None
+        assert claimed.status == "running"
+
+
+def test_non_reviewer_child_waits_for_blocked_review_required_parent(kanban_home):
+    with kb.connect() as conn:
+        impl = kb.create_task(conn, title="impl", assignee="qwencoder")
+        followup = kb.create_task(conn, title="followup", assignee="qwencoder", parents=[impl])
+
+        kb.block_task(conn, impl, reason="review-required: PR #123 open")
+
+        assert kb.get_task(conn, followup).status == "todo"
+        assert kb.claim_task(conn, followup, claimer="host:qwen") is None
+
+
+def test_reviewer_child_waits_for_non_review_blocked_parent(kanban_home):
+    with kb.connect() as conn:
+        impl = kb.create_task(conn, title="impl", assignee="qwencoder")
+        review = kb.create_task(conn, title="review", assignee="reviewer", parents=[impl])
+
+        kb.block_task(conn, impl, reason="needs-human-input: missing credentials")
+
+        assert kb.get_task(conn, review).status == "todo"
+        assert kb.claim_task(conn, review, claimer="host:reviewer") is None
+
+
 # ---------------------------------------------------------------------------
 # Atomic claim (CAS)
 # ---------------------------------------------------------------------------

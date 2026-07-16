@@ -668,6 +668,24 @@ class TestModelAutoCorrection:
         call_kwargs = mock_client.audio.transcriptions.create.call_args
         assert call_kwargs.kwargs["model"] == DEFAULT_STT_MODEL
 
+    def test_custom_openai_endpoint_preserves_groq_named_model(self, sample_wav):
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = {"text": "hello world"}
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value={
+                 "openai": {
+                     "api_key": "sk-dummy",
+                     "base_url": "http://localhost:8080/v1",
+                 }
+             }), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_openai
+            _transcribe_openai(sample_wav, "whisper-large-v3-turbo")
+
+        call_kwargs = mock_client.audio.transcriptions.create.call_args
+        assert call_kwargs.kwargs["model"] == "whisper-large-v3-turbo"
+
     def test_openai_corrects_distil_whisper(self, monkeypatch, sample_wav):
         monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
 

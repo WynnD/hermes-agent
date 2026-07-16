@@ -171,6 +171,7 @@ def _parse_service_response(
         "success": True,
         "service": f"{domain}.{service}",
         "affected_entities": affected,
+        "response": result.get("service_response") if isinstance(result, dict) else None,
     }
 
 
@@ -186,6 +187,13 @@ async def _async_call_service(
     hass_url, hass_token = _get_config()
     url = f"{hass_url}/api/services/{domain}/{service}"
     payload = _build_service_payload(entity_id, data)
+
+    # Some Home Assistant services (notably todo.get_items) require response
+    # data. HA rejects those calls unless the caller explicitly opts in with
+    # ?return_response. Most services do not need it, so only request it for the
+    # known response-returning services instead of changing all service calls.
+    if domain == "todo" and service == "get_items":
+        url = f"{url}?return_response"
 
     async with aiohttp.ClientSession() as session:
         async with session.post(

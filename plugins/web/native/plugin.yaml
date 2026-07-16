@@ -1,0 +1,7 @@
+name: web-native
+version: 1.0.0
+description: "Local no-API-key URL content extraction using httpx, Trafilatura, readability-lxml, and BeautifulSoup/markdownify fallbacks."
+author: NousResearch
+kind: backend
+provides_web_providers:
+  - native

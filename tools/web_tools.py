@@ -13,9 +13,10 @@ Available tools:
 
 Backend compatibility:
 - Exa: https://exa.ai (search, extract)
-- Firecrawl: https://docs.firecrawl.dev/introduction (search, extract; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
+- Firecrawl: https://docs.firecrawl.dev/introduction (search, extract, crawl; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
 - Parallel: https://docs.parallel.ai (search, extract)
-- Tavily: https://tavily.com (search, extract)
+- Native Extractor: local no-key extraction fallback for web_extract
+- Tavily: https://tavily.com (search, extract, crawl)
 
 LLM Processing:
 - Uses OpenRouter API with Gemini 3 Flash Preview for intelligent content extraction
@@ -228,7 +229,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in _LEGACY_WEB_BACKENDS or _registered_web_provider(configured) is not None:
+    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "native"}:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -247,6 +248,7 @@ def _get_backend() -> str:
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
+        ("native", True),
     )
     for backend, available in backend_candidates:
         if available:
@@ -339,6 +341,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("BRAVE_SEARCH_API_KEY")
     if backend == "ddgs":
         return _ddgs_package_importable()
+    if backend == "native":
+        return True
     if backend == "xai":
         # Cheap probe — env var OR auth.json has OAuth tokens. Must not
         # call resolve_xai_http_credentials() here because the OAuth path
@@ -857,7 +861,7 @@ async def web_extract_tool(
         else:
             backend = _get_extract_backend()
 
-            # All seven providers (brave-free, ddgs, searxng, exa, parallel,
+            # Web providers (brave-free, ddgs, searxng, exa, native, parallel,
             # tavily, firecrawl) now live as plugins. The dispatcher is a
             # registry lookup + delegation. Some providers' extract() is
             # async (parallel, firecrawl), others sync (exa, tavily) — we
@@ -886,8 +890,8 @@ async def web_extract_tool(
                             "error": (
                                 f"{provider.display_name} is a search-only "
                                 "backend and cannot extract URL content. "
-                                "Set web.extract_backend to firecrawl, "
-                                "tavily, exa, or parallel."
+                                "Set web.extract_backend to native, "
+                                "firecrawl, tavily, exa, or parallel."
                             ),
                         },
                         ensure_ascii=False,
@@ -920,8 +924,8 @@ async def web_extract_tool(
                             "success": False,
                             "error": (
                                 "No web extract provider configured. "
-                                "Set web.extract_backend to firecrawl, "
-                                "tavily, exa, or parallel."
+                                "Set web.extract_backend to native, "
+                                "firecrawl, tavily, exa, or parallel."
                             ),
                         },
                         ensure_ascii=False,
@@ -1048,7 +1052,32 @@ async def web_extract_tool(
 
 # Convenience function to check Firecrawl credentials
 def check_web_api_key() -> bool:
-    """Check whether the configured web backend is available.
+    """Check whether the configured web search backend is available."""
+    configured = _load_web_config().get("backend", "").lower().strip()
+    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai"}:
+        return _is_backend_available(configured)
+    return any(
+        _is_backend_available(backend)
+        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai")
+    )
+
+
+def check_web_extract_backend() -> bool:
+    """Check whether the configured web_extract backend is available."""
+    cfg = _load_web_config()
+    configured = (cfg.get("extract_backend") or cfg.get("backend") or "").lower().strip()
+    if configured in {"exa", "parallel", "firecrawl", "tavily", "native"}:
+        return _is_backend_available(configured)
+    return any(
+        _is_backend_available(backend)
+        for backend in ("exa", "parallel", "firecrawl", "tavily", "native")
+    )
+
+
+def check_auxiliary_model() -> bool:
+    """Check if an auxiliary text model is available for LLM content processing."""
+    client, _, _ = _resolve_web_extract_auxiliary()
+    return client is not None
 
     Used as the ``check_fn`` gate for the ``web_search`` and ``web_extract``
     tool registry entries — so a plugin-registered provider that reports
@@ -1226,11 +1255,8 @@ registry.register(
     toolset="web",
     schema=WEB_EXTRACT_SCHEMA,
     handler=lambda args, **kw: web_extract_tool(
-        args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [],
-        "markdown",
-        char_limit=args.get("char_limit"),
-    ),
-    check_fn=check_web_api_key,
+        args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
+    check_fn=check_web_extract_backend,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",
