@@ -100,6 +100,18 @@ def _normalize_task_list(
             return None, f"Task {i} must be an object, got {type(task).__name__}."
         if not task.get("goal", "").strip():
             return None, f"Task {i} is missing a 'goal'."
+        for field in ("model", "provider", "reasoning_effort"):
+            if field not in task:
+                continue
+            value = task[field]
+            # Empty string means "no override" (dropped); a non-string or a value that strips
+            # to nothing is a malformed override and fails the call before any child spawns.
+            if not isinstance(value, str) or (value and not value.strip()):
+                return None, f"Task {i} '{field}' must be a non-empty string"
+            if value:
+                task[field] = value.strip()
+            else:
+                del task[field]
     # The single-goal form is exempt from the batch gate (short goals are valid there).
     batch_error = _validate_batch_tasks(task_list) if isinstance(tasks, list) else None
     return (None, batch_error) if batch_error else (task_list, None)
