@@ -1707,12 +1707,52 @@ class GatewayInboundMixin:
 
         message_text = self._prefix_inbound_sender_context(event, source, message_text)
         image_paths, audio_paths, audio_file_paths, video_paths = self._classify_inbound_media(event, _pending_stt_prepared)
+
+        async def _rename_discord_auto_thread_from_processed_attachment(
+            before_text: str,
+            after_text: str,
+            *,
+            reason: str | None = None,
+        ) -> None:
+            """Post-enrichment hook: upgrade a cheap Discord attachment placeholder thread title."""
+            if after_text == before_text:
+                return
+            _attachment_thread = getattr(event, "_discord_auto_threaded_attachment_channel", None)
+            if not _attachment_thread:
+                return
+            _adapters = getattr(self, "adapters", None)
+            _discord_adapter = _adapters.get(source.platform) if _adapters else None
+            _rename = getattr(_discord_adapter, "rename_auto_thread_from_attachment_processing", None)
+            if _rename:
+                if reason is None:
+                    await _rename(_attachment_thread, after_text)
+                else:
+                    await _rename(_attachment_thread, after_text, reason=reason)
+
         if image_paths:
+            _before_vision_text = message_text
             message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
+            await _rename_discord_auto_thread_from_processed_attachment(
+                _before_vision_text,
+                message_text,
+                reason="Hermes auto-thread title from image description",
+            )
         if audio_paths:
+            _before_stt_text = message_text
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
+            await _rename_discord_auto_thread_from_processed_attachment(
+                _before_stt_text,
+                message_text,
+                reason="Hermes auto-thread title from voice transcript",
+            )
+        _before_file_notes_text = message_text
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
         message_text = self._prepend_inbound_document_notes(event, message_text)
+        await _rename_discord_auto_thread_from_processed_attachment(
+            _before_file_notes_text,
+            message_text,
+            reason="Hermes auto-thread title from processed attachment",
+        )
         if "@" in message_text:
             message_text = await self._expand_inbound_context_references(source, session_key, message_text)
             if message_text is None:

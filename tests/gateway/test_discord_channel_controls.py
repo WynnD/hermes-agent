@@ -86,13 +86,13 @@ def adapter(monkeypatch):
     return adapter
 
 
-def make_message(*, channel, content: str, mentions=None):
+def make_message(*, channel, content: str, mentions=None, attachments=None):
     author = SimpleNamespace(id=42, display_name="TestUser", name="TestUser")
     return SimpleNamespace(
         id=123,
         content=content,
         mentions=list(mentions or []),
-        attachments=[],
+        attachments=list(attachments or []),
         reference=None,
         created_at=datetime.now(timezone.utc),
         channel=channel,
@@ -240,3 +240,94 @@ def test_config_bridges_ignored_channels(monkeypatch, tmp_path):
     assert os.getenv("DISCORD_IGNORED_CHANNELS") == "111,222"
 
 
+
+
+# ── attachment-aware auto-thread titles + post-STT rename ────────────
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_uses_image_attachment_filename_when_text_is_empty(adapter):
+    """Attachment-first messages should not create useless 'Hermes' thread titles."""
+    attachment = SimpleNamespace(filename="router-error.png", content_type="image/png")
+    thread = FakeThread(channel_id=999, name="Image: router-error.png")
+    message = make_message(
+        channel=FakeTextChannel(channel_id=900),
+        content="",
+        attachments=[attachment],
+    )
+    message.create_thread = AsyncMock(return_value=thread)
+
+    await adapter._auto_create_thread(message)
+
+    message.create_thread.assert_awaited_once()
+    assert message.create_thread.await_args.kwargs["name"] == "Image: router-error.png"
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_uses_voice_attachment_author_when_text_is_empty(adapter):
+    """Voice-message-only threads should identify the speaker instead of saying Hermes."""
+    attachment = SimpleNamespace(filename="voice-message.ogg", content_type="audio/ogg")
+    thread = FakeThread(channel_id=999, name="Voice message from TestUser")
+    message = make_message(
+        channel=FakeTextChannel(channel_id=900),
+        content="",
+        attachments=[attachment],
+    )
+    message.create_thread = AsyncMock(return_value=thread)
+
+    await adapter._auto_create_thread(message)
+
+    message.create_thread.assert_awaited_once()
+    assert message.create_thread.await_args.kwargs["name"] == "Voice message from TestUser"
+
+
+@pytest.mark.asyncio
+async def test_rename_auto_thread_from_voice_transcript(adapter):
+    """After STT succeeds, the generic voice title should become transcript-derived."""
+    thread = FakeThread(channel_id=999, name="Voice message from TestUser")
+    thread.edit = AsyncMock()
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999), get_channel=lambda _id: thread,
+    )
+
+    await adapter.rename_auto_thread_from_transcript(thread, "Can we fix the thread title bug?")
+
+    thread.edit.assert_awaited_once_with(
+        name="Can we fix the thread title bug?",
+        reason="Hermes auto-thread title from voice transcript",
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_renames_from_generic_attachment_processing(adapter):
+    """Post-processing should rename any attachment placeholder title, not just voice."""
+    thread = FakeThread(channel_id=999, name="Image: router-error.png")
+    thread.edit = AsyncMock()
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999), get_channel=lambda _id: thread,
+    )
+
+    await adapter.rename_auto_thread_from_attachment_processing(
+        thread,
+        "[The user sent an image~ Here's what I can see:\nA screenshot of a router error page showing DNS failure.]",
+    )
+
+    thread.edit.assert_awaited_once_with(
+        name="A screenshot of a router error page showing DNS failure.",
+        reason="Hermes auto-thread title from processed attachment",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_does_not_stomp_human_title(adapter):
+    """A human-renamed or text-derived thread must never be rewritten."""
+    thread = FakeThread(channel_id=999, name="My own clever name")
+    thread.edit = AsyncMock()
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999), get_channel=lambda _id: thread,
+    )
+
+    result = await adapter.rename_auto_thread_from_transcript(thread, "Some transcript")
+
+    assert result is False
+    thread.edit.assert_not_awaited()

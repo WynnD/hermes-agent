@@ -313,6 +313,74 @@ def _truncate_discord_component_text(text: str, limit: int) -> str:
     return _prefix_within_utf16_limit(str(text or ""), max(0, limit))
 
 
+def _clean_discord_attachment_filename(filename: str) -> str:
+    """Return a human-sized Discord attachment filename for thread titles."""
+    filename = os.path.basename((filename or "").strip())
+    filename = re.sub(r"\s+", " ", filename).strip()
+    return filename[:60] if filename else "attachment"
+
+
+def _discord_attachment_thread_title(message: Any) -> str:
+    """Derive a useful auto-thread title from attachment metadata.
+
+    Discord attachment-first messages have empty ``message.content`` so the old
+    fallback produced piles of indistinguishable ``Hermes`` threads. Prefer
+    cheap, deterministic metadata here; deeper summaries can rename later when
+    the attachment has actually been processed.
+    """
+    attachments = list(getattr(message, "attachments", None) or [])
+    if not attachments:
+        return "Hermes"
+
+    author = getattr(message, "author", None)
+    author_name = (
+        getattr(author, "display_name", None)
+        or getattr(author, "name", None)
+        or "user"
+    )
+
+    if len(attachments) > 1:
+        names = [
+            _clean_discord_attachment_filename(getattr(att, "filename", ""))
+            for att in attachments[:2]
+        ]
+        suffix = "…" if len(attachments) > 2 else ""
+        return f"{len(attachments)} attachments: {', '.join(names)}{suffix}"[:80]
+
+    att = attachments[0]
+    filename = _clean_discord_attachment_filename(getattr(att, "filename", ""))
+    content_type = (getattr(att, "content_type", None) or "").lower()
+
+    if content_type.startswith("image/"):
+        return f"Image: {filename}"[:80]
+    if content_type.startswith("video/"):
+        return f"Video: {filename}"[:80]
+    if content_type.startswith("audio/"):
+        return f"Voice message from {author_name}"[:80]
+    return f"File: {filename}"[:80]
+
+
+def _derive_discord_thread_name_from_text(text: str) -> str:
+    """Build a concise Discord thread title from text/transcript content."""
+    title = " ".join((text or "").strip().split())
+    # Strip common attachment-enrichment wrappers if a caller passes enriched
+    # event text instead of the raw processed content.
+    wrapper_patterns = (
+        r"Here's what they said: \"([^\"]+)\"",
+        r"Here's what I can see:\s*(.+?)\s*\](?:\s*\[|$)",
+        r"\[Content of [^\]]+\]:\s*(.+)$",
+    )
+    for pattern in wrapper_patterns:
+        match = re.search(pattern, title, flags=re.DOTALL)
+        if match:
+            title = match.group(1).strip()
+            break
+    title = title.lstrip("#").strip()
+    if len(title) > 80:
+        title = title[:77].rstrip() + "..."
+    return title or "Processed attachment"
+
+
 def _abort_discord_websocket_transport(websocket: Any) -> bool:
     """Abort the active aiohttp transport after a bounded close times out."""
     socket = getattr(websocket, "socket", None)
@@ -5286,20 +5354,24 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     # Auto-thread helpers
     # ------------------------------------------------------------------
 
-    def _derive_auto_thread_name(self, content: str) -> str:
+    def _derive_auto_thread_name(self, content: str, message: Any = None) -> str:
         """Fast placeholder thread name with mentions stripped (raw <@id> tokens mean nothing to humans).
         Semantic renaming happens after the first agent turn, once an LLM session title exists.
 
         Strip Discord mention syntax (users / roles / channels) so thread titles don't show raw <@id>,
         <@&id>, or <#id> markers — the ID isn't meaningful to humans glancing at the thread list (#6336).
-        Real semantic naming is done after the first agent turn, when Hermes has an LLM-generated session
-        title and can safely rename only this newly-created thread.
+        For attachment-first messages (empty content), derive a cheap deterministic title from
+        attachment metadata instead of the useless ``Hermes`` fallback. Real semantic naming is done
+        after the first agent turn, when Hermes has an LLM-generated session title and can safely
+        rename only this newly-created thread.
         """
         content = (content or "").strip()
         # <@123>, <@!123>, <@&123>, <#123> — collapse to empty; normalize spaces.
         content = re.sub(r"<@[!&]?\d+>", "", content)
         content = re.sub(r"<#\d+>", "", content)
         content = re.sub(r"\s+", " ", content).strip()
+        if not content and message is not None:
+            return _discord_attachment_thread_title(message)
         thread_name = content[:80] if content else "Hermes"
         if len(content) > 80:
             thread_name = thread_name[:77] + "..."
@@ -5321,7 +5393,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         ``Cannot connect to host discord.com:443``) don't immediately burn through to the caller's failure
         path (#20243).
         """
-        thread_name = self._derive_auto_thread_name(message.content or "")
+        thread_name = self._derive_auto_thread_name(message.content or "", message)
         display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
         reason = f"Auto-threaded from mention by {display_name}"
         last_direct_error: Exception | None = None
@@ -5350,8 +5422,55 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         )
         return None
 
+    async def rename_auto_thread_from_attachment_processing(
+        self,
+        thread: Any,
+        processed_text: str,
+        *,
+        reason: str = "Hermes auto-thread title from processed attachment",
+    ) -> bool:
+        """Rename an auto-created attachment thread once processing reveals content.
+
+        Guarded two ways: a cheap local pre-filter only considers Hermes-generated
+        attachment placeholder titles, and the actual edit goes through
+        ``rename_thread(only_if_current_name=...)`` so a human rename that landed
+        in between is never stomped.
+        """
+        if not thread:
+            return False
+        current_name = str(getattr(thread, "name", "") or "")
+        # Only rewrite cheap attachment placeholders created by Hermes; do not
+        # stomp a human title or a text-derived auto-thread title.
+        placeholder_prefixes = (
+            "Voice message",
+            "Image:",
+            "Video:",
+            "File:",
+        )
+        is_multi_attachment_placeholder = bool(re.match(r"^\d+ attachments:", current_name))
+        if not current_name or not (
+            current_name.startswith(placeholder_prefixes) or is_multi_attachment_placeholder
+        ):
+            return False
+        new_name = _derive_discord_thread_name_from_text(processed_text)
+        if not new_name or new_name == current_name:
+            return False
+        return await self.rename_thread(
+            str(getattr(thread, "id", "")), new_name,
+            only_if_current_name=current_name, reason=reason,
+        )
+
+    async def rename_auto_thread_from_transcript(self, thread: Any, transcript: str) -> bool:
+        """Rename an auto-created voice thread once STT reveals what it is about."""
+        return await self.rename_auto_thread_from_attachment_processing(
+            thread,
+            transcript,
+            reason="Hermes auto-thread title from voice transcript",
+        )
+
     async def rename_thread(
         self, thread_id: str, name: str, *, only_if_current_name: Optional[str] = None,
+        reason: str = "Hermes semantic session title",
     ) -> bool:
         """Best-effort rename; ``only_if_current_name`` protects human-renamed/pre-existing threads (no-op on mismatch)."""
         if not self._client or not DISCORD_AVAILABLE:
@@ -5387,7 +5506,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if edit is None:
             return False
         try:
-            await edit(name=cleaned, reason="Hermes semantic session title")
+            await edit(name=cleaned, reason=reason)
             logger.info(
                 "[%s] Renamed Discord thread %s from %r to %r",
                 self.name, thread_id, current_name, cleaned,
@@ -6075,7 +6194,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             auto_thread_created=auto_threaded_channel is not None,
             auto_thread_initial_name=(
                 getattr(auto_threaded_channel, "_hermes_auto_thread_initial_name", None)
-                or self._derive_auto_thread_name(message.content or "")
+                or self._derive_auto_thread_name(message.content or "", message)
             ) if auto_threaded_channel is not None else None,
         )
         media_urls, media_types, media_text_inlined, pending_text_injection = await self._collect_attachment_media(
@@ -6131,6 +6250,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             timestamp=message.created_at, auto_skill=_skills, channel_prompt=_channel_prompt,
             channel_context=_channel_context,
         )
+        # Pass the auto-created thread ref through the gateway lifecycle so the
+        # post-processing rename hook (STT / vision / document enrichment) can
+        # upgrade the cheap attachment placeholder title once content is known.
+        if auto_threaded_channel is not None:
+            try:
+                setattr(event, "_discord_auto_threaded_attachment_channel", auto_threaded_channel)
+            except Exception:
+                pass
         if (
             getattr(getattr(message, "author", None), "bot", False)
             and self._is_bot_tag_debounce_continuation(message)
