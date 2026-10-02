@@ -423,12 +423,36 @@ def _build_children(
         _child_context = t.get("context")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
+        # A per-task model/provider/reasoning_effort re-resolves credentials from a routing_cfg copy;
+        # override-less tasks reuse the batch resolution (and its error text) untouched. The child
+        # keeps the BATCH routing_cfg so fallback-policy ownership does not move to the task copy.
+        # A per-task PROVIDER override drops the batch pin's base_url/api_key/api_mode: those belong
+        # to the delegation pin's endpoint, and keeping them would send the task's provider name to
+        # the wrong host (base_url short-circuits provider resolution in _resolve_delegation_credentials).
+        task_creds, task_overrides = creds, overrides
         try:
+            if any(k in t for k in ("model", "provider", "reasoning_effort")):
+                task_cfg = dict(routing_cfg)
+                if "provider" in t:
+                    for k in ("base_url", "api_key", "api_mode"):
+                        task_cfg.pop(k, None)
+                for k in ("model", "provider", "reasoning_effort"):
+                    if k in t:
+                        task_cfg[k] = t[k]
+                task_creds = _resolve_delegation_credentials(task_cfg, parent_agent)
+                task_overrides = {
+                    "override_provider": task_creds["provider"], "override_base_url": task_creds["base_url"],
+                    "override_api_key": task_creds["api_key"], "override_api_mode": task_creds["api_mode"],
+                    "override_request_overrides": task_creds.get("request_overrides"),
+                    "override_acp_command": task_creds.get("command"),
+                    "override_acp_args": task_creds.get("args"),
+                    "routing_cfg": routing_cfg,
+                }
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                model=task_creds["model"], max_iterations=max_iterations, task_count=len(task_list),
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **task_overrides,
             )
         except ValueError as exc:
             return [], str(exc)
@@ -736,6 +760,26 @@ DELEGATE_TASK_SCHEMA = {
                             "is enabled; otherwise the whole call returns as one message). Tasks sharing a group return "
                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
                             "order execution; if B needs A's output, dispatch B after A returns.",
+                        ),
+                        "model": _p(
+                            "string",
+                            "Optional model override for THIS child (e.g. 'qwen3.8-27b'). Resolution order: this "
+                            "task's model/provider → delegation config → inherit parent. Omit to use the configured "
+                            "delegation default. Credentials always come from config — you cannot point a child at "
+                            "an arbitrary endpoint.",
+                        ),
+                        "provider": _p(
+                            "string",
+                            "Optional provider slug for THIS child's model override (must be a provider already "
+                            "configured in config.yaml, e.g. 'snowball'). Unknown providers fail preflight with a "
+                            "loud error before any child spawns.",
+                        ),
+                        "reasoning_effort": _p(
+                            "string",
+                            "Optional reasoning-effort tier for THIS child "
+                            "('ultra'|'max'|'xhigh'|'high'|'medium'|'low'|'minimal'|'none'). Set it when the "
+                            "overridden model's endpoint rejects the configured delegation effort tier (mismatch = "
+                            "every child dies instantly with HTTP 400).",
                         ),
                     },
                     "required": ["goal"],
