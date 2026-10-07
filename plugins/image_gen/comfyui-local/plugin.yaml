@@ -1,0 +1,5 @@
+name: comfyui-local-image-gen
+version: 1.0.0
+description: "Local ComfyUI image generation (Krea 2 Turbo FP8) on snowball :8188. Shells to ~/.hermes/scripts/gen_image.py. Free, private, on-LAN."
+author: Wynn + Zhu Li
+kind: backend
