@@ -33,6 +33,15 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
 )
 
 
+# Thinking-leak re-prompt: the previous reply was internal reasoning delivered to the user
+# instead of an answer — no plan restating, act now.
+_THINKING_LEAK_NUDGE = (
+    "[System: Your previous message was internal reasoning delivered to the user instead of "
+    "an answer. Do not restate the plan — make the tool calls now and then deliver the "
+    "actual result.]"
+)
+
+
 @dataclass
 class FinalResponseVerdict:
     """``action``: ``"break"`` (turn ends with ``final_response``), ``"continue"`` (a
@@ -165,7 +174,8 @@ def finish_text_response(
     # delivery channel (gateway status message / CLI print). NEVER appended to messages/api_messages:
     # conversation context and the cached prompt prefix stay byte-identical.
     from agent.agent_runtime_helpers import (
-        intent_ack_continuation_mode, looks_like_degenerate_final, promoted_reasoning_announces_action,
+        content_looks_like_thinking_leak, intent_ack_continuation_mode,
+        looks_like_degenerate_final, promoted_reasoning_announces_action,
         tool_results_this_turn, trailing_continue_intent,
     )
 
@@ -186,6 +196,18 @@ def finish_text_response(
             or (bool(_promoted) and promoted_reasoning_announces_action(_stall_text))
         )
     )
+    # Thinking-leak guard: the turn DID real tool work, then the model emitted its internal
+    # reasoning as visible content with finish_reason=stop and no tool call — the user sees a
+    # line of self-talk and gets no work. Gated on prior tool results so a genuine no-tool
+    # reply that merely opens with a future offer ("I'll send you the report tomorrow.") is
+    # never re-prompted. Same scope knob and the SAME bounded counter as the other guards.
+    _thinking_leak = (
+        bool(getattr(agent, "_stall_guards", True))
+        and agent.valid_tool_names
+        and codex_ack_continuations < 2
+        and tool_results_this_turn(messages) > 0
+        and content_looks_like_thinking_leak(_stall_text)
+    )
     # Degenerate-final guard (#103483): the turn did real tool work and then stopped on a
     # fragment. Same scope knob and the SAME bounded counter as the ack continuation; the nudge
     # row itself closes the tool-work window, so a second fragment ends the turn as the answer.
@@ -197,9 +219,12 @@ def finish_text_response(
         and _tool_rows > 0
         and looks_like_degenerate_final(_stall_text, user_message=user_message)
     )
-    # Precedence: an announced next action outranks the fragment shape; the codex ack is last.
+    # Precedence: an announced next action outranks a leaked plan, the leaked plan outranks
+    # the fragment shape, and the codex ack is last.
     if _stall_continue_intent:
         _continuation_kind = "stall"
+    elif _thinking_leak:
+        _continuation_kind = "thinking_leak"
     elif _degenerate_final:
         _continuation_kind = "degenerate"
     elif (
@@ -221,6 +246,12 @@ def finish_text_response(
                 "intent with no tool calls — re-prompting to act "
                 "(%d/2)", codex_ack_continuations + 1,
             )
+        elif _continuation_kind == "thinking_leak":
+            logger.warning(
+                "Thinking leak: turn did %d tool result(s) then emitted internal reasoning "
+                "as the visible answer %r — re-prompting to act (%d/2)",
+                _tool_rows, _stall_text[:60], codex_ack_continuations + 1,
+            )
         elif _continuation_kind == "degenerate":
             logger.warning(
                 "Degenerate final: %d-char fragment %r ended the turn after %d tool result(s) — "
@@ -238,7 +269,8 @@ def finish_text_response(
         append_message(messages, {
             "role": "user",
             "content": (
-                _DEGENERATE_FINAL_NUDGE if _continuation_kind == "degenerate"
+                _THINKING_LEAK_NUDGE if _continuation_kind == "thinking_leak"
+                else _DEGENERATE_FINAL_NUDGE if _continuation_kind == "degenerate"
                 else _CODEX_ACK_CONTINUATION_NUDGE
             ),
         })

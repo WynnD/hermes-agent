@@ -485,3 +485,61 @@ def test_promoted_reasoning_detector_ignores_thai_stated_answers():
         "พรุ่งนี้จะฝนตกทั่วประเทศ",  # "tomorrow it will rain" — not a first-person action verb
     ):
         assert not promoted_reasoning_announces_action(text), text
+
+
+# ── thinking-leak detector ──────────────────────────────────────────────────
+
+
+def test_thinking_leak_detector_catches_third_person_self_narration():
+    from agent.agent_runtime_helpers import content_looks_like_thinking_leak
+
+    # Verbatim fixture: internal reasoning emitted as visible content (2026-10-06, glm-5.3-flash).
+    assert content_looks_like_thinking_leak(
+        "He's asking a real money question — let me pull live Monarch data rather than "
+        "recite the profile, and compare this year's travel/fun spend against last year's."
+    )
+    assert content_looks_like_thinking_leak("They're asking about the warranty.")
+    assert content_looks_like_thinking_leak("She needs the report before noon.")
+    assert content_looks_like_thinking_leak("The user is asking for a price check.")
+
+
+def test_thinking_leak_detector_catches_pure_plan_monologue_tails():
+    from agent.agent_runtime_helpers import content_looks_like_thinking_leak
+
+    # The detector itself may fire on a first-person future offer in a short reply — the
+    # no-tool gate lives in turn_final_response.py (tool_results_this_turn > 0).
+    assert content_looks_like_thinking_leak("I'll send you the report tomorrow.")
+    assert content_looks_like_thinking_leak("I'm going to run the tests now.")
+    assert content_looks_like_thinking_leak("I need to check the log.")
+    assert content_looks_like_thinking_leak("Let me check the file first.")
+
+
+def test_thinking_leak_detector_ignores_answers_and_let_me_know():
+    from agent.agent_runtime_helpers import content_looks_like_thinking_leak
+
+    for text in (
+        "Let me know if you want more.",  # "let me know" must never fire
+        "Let me know how it goes.",
+        "The answer is 42.",
+        "Let me check. The answer is 42.",  # plan clause mid-text, answer stated after
+        "All tests pass and the branch is pushed.",
+        # Legit answers that merely mention a third person — person mention alone is not
+        # a leak; a request/plan signal is required (review pass, 2026-10-06).
+        "He's a lawyer, not an AI professional.",
+        "She is running the CI now.",
+        "They want the report formatted as PDF.",
+        "She wants the summary before the meeting.",
+        "",
+        None,
+    ):
+        assert not content_looks_like_thinking_leak(text), text
+
+
+def test_thinking_leak_detector_ignores_long_substantive_replies():
+    from agent.agent_runtime_helpers import content_looks_like_thinking_leak
+
+    # Same 400-char cap as trailing_continue_intent: a substantive reply that happens to
+    # end on a plan clause is not a pure plan monologue.
+    long_reply = ("Here is the full analysis. " * 20) + "…so I'll refine it tomorrow."
+    assert len(long_reply) > 400
+    assert not content_looks_like_thinking_leak(long_reply)

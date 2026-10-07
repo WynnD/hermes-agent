@@ -3513,6 +3513,53 @@ def promoted_reasoning_announces_action(text: str) -> bool:
     return bool(_PROMOTED_REASONING_PLAN_TAIL_RE.search(t[-240:]))
 
 
+# Thinking-leak detector for the stall guard: the model ended its turn by emitting internal
+# reasoning as visible ``content`` with finish_reason=stop and no tool call, even though the
+# hidden reasoning held a correct plan and tools were used earlier in the turn. Two
+# independent detectors — EITHER firing means the text is thinking-voice, not answer-voice.
+# (a) Answer-voice never OPENS by narrating the user in third person; thinking-voice does
+#     ("He's asking a real money question — let me pull live Monarch data…"). The person
+#     mention alone is NOT enough — "He's a lawyer, not an AI professional." is a legitimate
+#     answer, and "They want the report as PDF" can be one too — so the opener must carry an
+#     unambiguous REQUEST (asks/asking/needs) or PLAN (let me/I'll/I will/is going) signal.
+_THINKING_LEAK_THIRD_PERSON_RE = re.compile(
+    r"^\s*(?:\b(?:he|she|it|they)\b|\bthe\s+user\b)"
+    r"[^.!?\n]{0,80}?\b(?:asks?|asking|needs?|is\s+going|let\s+me|i(?:['\u2019]ll|\s+will))\b",
+    re.IGNORECASE,
+)
+
+# (b) A SHORT reply whose FINAL sentence opens on a first-person future marker
+#     ("let me", "I'll", "I will", "I'm going to", "I need to") followed by a verb-ish
+#     token — a pure plan monologue. Same 400-char cap as ``trailing_continue_intent``:
+#     longer text is a substantive reply that merely ends on a plan clause. The first
+#     token after the marker is captured so ``let me know`` can be excluded — the
+#     conversational offer "Let me know if you want more." must NEVER fire.
+_THINKING_LEAK_PLAN_TAIL_RE = re.compile(
+    r"(?:^|[.!?\u2026\n]\s*)"
+    r"(?:let\s+me\b|i(?:['\u2019]ll|\s+will)\b|i['\u2019]m\s+going\s+to\b|\bi\s+need\s+to\b)"
+    r"\s+([a-z]+)[^.!?\u2026\n]*(?:[.!?\u2026]+)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def content_looks_like_thinking_leak(text: str) -> bool:
+    """Whether ``text`` is internal reasoning leaked to the visible answer channel.
+
+    True if it opens by narrating the user in third person, or if it is a short reply whose
+    final sentence is a first-person plan to act (``let me know`` excluded). Whether to
+    actually re-prompt is decided by the caller's gate (real tool work earlier in the turn).
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _THINKING_LEAK_THIRD_PERSON_RE.match(t):
+        return True
+    if len(t) > _TRAILING_CONTINUE_INTENT_MAX_CHARS:
+        return False
+    m = _THINKING_LEAK_PLAN_TAIL_RE.search(t)
+    return bool(m) and m.group(1).lower() != "know"
+
+
 _INTENT_ACK_ON = {"true", "always", "yes", "on"}
 _INTENT_ACK_OFF = {"false", "never", "no", "off"}
 
